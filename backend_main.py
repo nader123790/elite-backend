@@ -10,21 +10,43 @@ import math
 import firebase_admin
 from firebase_admin import credentials, firestore
 import os
+import json
+import tempfile
+import sys
 
 # ── تشغيل Firebase Admin ──────────────────────────────────────────────────
-import json, tempfile
 
 _creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 if _creds_json:
-    # لو شغال على سيرفر (Render / Railway / VPS)
+    # ✅ شغال على سيرفر (Render / Railway / VPS) — بياخد الـ credentials من Environment Variable
+    try:
+        # تأكد إن الـ JSON صالح قبل ما نكتبه
+        json.loads(_creds_json)
+    except json.JSONDecodeError as e:
+        print(f"❌ خطأ: GOOGLE_APPLICATION_CREDENTIALS_JSON مش JSON صالح → {e}", file=sys.stderr)
+        sys.exit(1)
+
     _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
     _tmp.write(_creds_json)
     _tmp.close()
     _SERVICE_KEY = _tmp.name
+    print("✅ Firebase: جاري التحميل من Environment Variable")
+
 else:
-    # لو شغال محلي
+    # شغال محلي — بيدور على الملف
     _SERVICE_KEY = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+
+    if not os.path.exists(_SERVICE_KEY):
+        print(
+            "❌ خطأ: ملف serviceAccountKey.json مش موجود!\n"
+            "   إما حط الملف جنب backend_main.py\n"
+            "   أو حط محتواه في Environment Variable: GOOGLE_APPLICATION_CREDENTIALS_JSON",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"✅ Firebase: جاري التحميل من الملف → {_SERVICE_KEY}")
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(_SERVICE_KEY)
@@ -35,8 +57,6 @@ db = firestore.client()
 # ── FastAPI ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Harafy Agent", version="1.1.0")
 
-# ✅ FIX 1: ضيّق الـ CORS للـ production
-# غيّر "*" لـ domain بتاعك لما ترفع على سيرفر حقيقي
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # TODO: غيّره لـ ["https://yourdomain.com"] في production
@@ -97,11 +117,6 @@ def health():
 
 @app.post("/match-driver")
 async def match_driver(req: MatchRequest):
-    """
-    يجيب كل السائقين المتاحين من Firestore
-    ويطبّق عليهم Utility Function
-    ويرجع أحسن سائق.
-    """
     try:
         docs = (
             db.collection("users")
@@ -130,8 +145,6 @@ async def match_driver(req: MatchRequest):
         best.get("lon", req.user_lon),
     )
 
-    # ✅ FIX 2: حساب الـ ETA صح
-    # السرعة المتوسطة في الزحمة ≈ 20 كم/ساعة = 0.333 كم/دقيقة
     SPEED_KM_PER_MIN = 20 / 60
     eta_min = max(1, round(dist_km / SPEED_KM_PER_MIN))
 
@@ -151,7 +164,6 @@ async def match_driver(req: MatchRequest):
 
 @app.post("/trip-status")
 async def update_trip_status(req: TripStatusRequest):
-    """السائق يغيّر حالة الرحلة."""
     valid = {"accepted", "arrived", "started", "completed", "cancelled"}
     if req.status not in valid:
         raise HTTPException(status_code=400, detail="invalid_status")
@@ -163,7 +175,6 @@ async def update_trip_status(req: TripStatusRequest):
 
     trip_data = trip.to_dict()
 
-    # ✅ FIX 3: تأكد إن السائق ده هو فعلاً سائق الرحلة (أمان)
     if trip_data.get("driver_id") != req.driver_id:
         raise HTTPException(status_code=403, detail="not_your_trip")
 
@@ -171,20 +182,16 @@ async def update_trip_status(req: TripStatusRequest):
 
     driver_ref = db.collection("users").document(req.driver_id)
 
-    # ✅ FIX 4: إدارة is_available بشكل صح حسب حالة الرحلة
     if req.status == "accepted":
-        # السائق اتقبل الرحلة — مش متاح لرحلات تانية
         driver_ref.update({"is_available": False})
 
     elif req.status == "completed":
-        # الرحلة خلصت — زوّد العداد وخلّيه متاح تاني
         driver_ref.update({
             "trips_count": firestore.Increment(1),
             "is_available": True,
         })
 
     elif req.status == "cancelled":
-        # الرحلة اتلغت — السائق يبقى متاح تاني
         driver_ref.update({"is_available": True})
 
     ref.update(updates)
@@ -193,7 +200,6 @@ async def update_trip_status(req: TripStatusRequest):
 
 @app.get("/driver/{driver_id}/stats")
 async def driver_stats(driver_id: str):
-    """إحصائيات السائق."""
     doc = db.collection("users").document(driver_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="driver_not_found")
