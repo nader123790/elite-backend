@@ -12,7 +12,20 @@ from firebase_admin import credentials, firestore
 import os
 
 # ── تشغيل Firebase Admin ──────────────────────────────────────────────────
-_SERVICE_KEY = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+import json, tempfile
+
+_creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+if _creds_json:
+    # لو شغال على سيرفر (Render / Railway / VPS)
+    _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
+    _tmp.write(_creds_json)
+    _tmp.close()
+    _SERVICE_KEY = _tmp.name
+else:
+    # لو شغال محلي
+    _SERVICE_KEY = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+
 if not firebase_admin._apps:
     cred = credentials.Certificate(_SERVICE_KEY)
     firebase_admin.initialize_app(cred)
