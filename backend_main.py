@@ -1,44 +1,12 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              Harafy — Utility-Based AI Agent Backend  v2.0                 ║
-║              FastAPI + Firebase + Advanced Multi-Criteria Agent             ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+from __future__ import annotations
 
-Architecture:
-  ┌─────────────────────────────────────────────────────────┐
-  │               PERCEPT  →  AGENT  →  ACTION              │
-  │                                                         │
-  │  Percepts:                                              │
-  │    • Available drivers (location, rating, trips_today)  │
-  │    • Time of day (rush hour?)                           │
-  │    • Demand density in area                             │
-  │    • Driver refusal history                             │
-  │    • User wait time                                     │
-  │                                                         │
-  │  Utility Function (multi-criteria weighted):            │
-  │    U = w1·proximity + w2·quality + w3·availability      │
-  │      + w4·reliability + w5·responsiveness               │
-  │                                                         │
-  │  Weights are DYNAMIC — shift based on context:          │
-  │    Rush hour → proximity weight ↑                       │
-  │    High demand → availability weight ↑                  │
-  │    Long wait → responsiveness weight ↑                  │
-  │    Night → reliability weight ↑                         │
-  │                                                         │
-  │  Actions:                                               │
-  │    • match_driver → update Firestore trip               │
-  │    • update_trip_status → driver availability           │
-  │    • surge_pricing → dynamic price multiplier           │
-  │    • blacklist_temp → penalize serial refusers          │
-  └─────────────────────────────────────────────────────────┘
-"""
 from geo_pricing_module import (
              RouteEngine, GeocodingEngine, TripPricingEngine,
              PriceEstimateRequest, GeocodeRequest, ReverseGeocodeRequest,
              RouteRequest,geo_router
          )
 
-from __future__ import annotations
+
 
 import json
 import math
