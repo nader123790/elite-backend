@@ -32,6 +32,11 @@ Architecture:
   │    • blacklist_temp → penalize serial refusers          │
   └─────────────────────────────────────────────────────────┘
 """
+from geo_pricing_module import (
+             RouteEngine, GeocodingEngine, TripPricingEngine,
+             PriceEstimateRequest, GeocodeRequest, ReverseGeocodeRequest,
+             RouteRequest,geo_router
+         )
 
 from __future__ import annotations
 
@@ -92,6 +97,8 @@ app = FastAPI(
     version="2.0.0",
     description="AI Agent يختار أفضل سائق بناءً على utility function ديناميكية",
 )
+
+app.include_router(geo_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1021,3 +1028,5 @@ async def update_driver_location(
             pass
 
     return {"ok": True}
+
+ 
