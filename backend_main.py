@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -636,90 +637,243 @@ class SurgePricingEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LLM DRIVER AGENT  —  بديل كامل لـ UtilityAgent
+#  LLM PROVIDER SYSTEM  —  Replaces Anthropic Claude dependency
+#
+#  Provider priority:
+#    1. Groq  (GROQ_API_KEY)         — fastest free tier, ~500 RPM
+#    2. Gemini (GEMINI_API_KEY)       — generous free tier, 1500 RPD
+#    3. Fallback scoring algorithm    — zero cost, always available
+#
+#  Set keys via environment variables:
+#    export GROQ_API_KEY="gsk_..."
+#    export GEMINI_API_KEY="AIza..."
+#
+#  If both keys are missing the system runs in pure fallback scoring mode.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-_LLM_URL    = "https://api.anthropic.com/v1/messages"
-_LLM_MODEL  = "claude-haiku-4-5-20251001"
-_LLM_TOKENS = 200
-
-_SELECT_DRIVER_TOOL = {
-    "name": "select_driver",
-    "description": "Select the single best driver from the candidates list.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "selected_driver_id": {
-                "type": "string",
-                "description": "The _id of the chosen driver",
-            },
-            "reason": {
-                "type": "string",
-                "description": "One or two sentences max explaining the choice",
-            },
-        },
-        "required": ["selected_driver_id", "reason"],
-    },
-}
+# ── Compact shared prompt (minimises tokens across all providers) ─────────────
 
 _SYSTEM_PROMPT = (
-    "You are a ride-hailing dispatcher. "
-    "Given a list of available drivers and trip context, call select_driver with the best choice. "
-    "Priority order: lowest ETA → highest rating → highest reliability. "
-    "Never pick a blacklisted driver. Keep reason under 2 sentences."
+    "Ride-hailing dispatcher. Given candidates, return JSON only: "
+    '{"selected_driver_id":"<id>","reason":"<1 sentence>"}. '
+    "Priority: lowest ETA → highest rating → highest reliability. "
+    "Never pick blacklisted. No extra text."
 )
 
 
-def _build_llm_prompt(candidates: list[dict], context: dict) -> str:
+def _build_prompt(candidates: list[dict], context: dict) -> str:
+    """Compact prompt — keeps token count low for all providers."""
     ctx = (
-        f"rush_hour={context['rush_hour']},"
-        f"late_night={context['late_night']},"
+        f"rush={context['rush_hour']},"
+        f"night={context['late_night']},"
         f"demand={context['demand_factor']}"
     )
-    rows = "\n".join(
-        f"id={c['id']},dist={c['dist_km']}km,eta={c['eta_min']}min,"
-        f"rating={c['rating']},reliability={c['reliability']},response={c['response_score']}"
+    rows = "|".join(
+        f"{c['id']},eta={c['eta_min']},rtg={c['rating']},rel={c['reliability']:.2f}"
         for c in candidates
     )
-    return f"context:{ctx}\ncandidates:\n{rows}"
+    return f"ctx:{ctx}\ncandidates:{rows}\nRespond JSON only."
 
 
-async def _call_llm(candidates: list[dict], context: dict) -> dict | None:
-    if not ANTHROPIC_API_KEY:
-        return None
+# ── Abstract provider interface ───────────────────────────────────────────────
 
-    payload = {
-        "model": _LLM_MODEL,
-        "max_tokens": _LLM_TOKENS,
-        "system": _SYSTEM_PROMPT,
-        "tools": [_SELECT_DRIVER_TOOL],
-        "tool_choice": {"type": "any"},
-        "messages": [{"role": "user", "content": _build_llm_prompt(candidates, context)}],
-    }
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(_LLM_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-        for block in data.get("content", []):
-            if block.get("type") == "tool_use" and block.get("name") == "select_driver":
-                return block["input"]
-        return None
-    except Exception as e:
-        log.warning(f"LLM call failed: {e}")
-        return None
+class LLMProvider(ABC):
+    """Base interface all LLM providers must implement."""
 
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def available(self) -> bool:
+        """True only when the required API key is present."""
+        ...
+
+    @abstractmethod
+    async def select_driver(self, candidates: list[dict], context: dict) -> dict | None:
+        """
+        Call the provider and parse the JSON response.
+        Returns {"selected_driver_id": str, "reason": str} or None on any failure.
+        """
+        ...
+
+    @staticmethod
+    def _parse_json_response(text: str) -> dict | None:
+        """Safely extract JSON from LLM text output."""
+        try:
+            # Strip markdown fences if present
+            clean = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            data = json.loads(clean)
+            if "selected_driver_id" in data and "reason" in data:
+                return data
+        except Exception:
+            pass
+        # Try to find JSON object in free-form text
+        try:
+            start = text.index("{")
+            end = text.rindex("}") + 1
+            return json.loads(text[start:end])
+        except Exception:
+            return None
+
+
+# ── Groq provider (preferred — fastest free tier) ────────────────────────────
+# Free tier: ~500 req/min on llama-3.1-8b-instant
+# Sign up: https://console.groq.com
+
+class GroqProvider(LLMProvider):
+    _URL = "https://api.groq.com/openai/v1/chat/completions"
+    _MODEL = "llama-3.1-8b-instant"          # fastest & cheapest on free tier
+    _TIMEOUT = 6.0
+    _MAX_TOKENS = 150
+
+    @property
+    def name(self) -> str:
+        return "groq/llama-3.1-8b-instant"
+
+    @property
+    def available(self) -> bool:
+        return bool(os.environ.get("GROQ_API_KEY", "").strip())
+
+    async def select_driver(self, candidates: list[dict], context: dict) -> dict | None:
+        api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        if not api_key:
+            return None
+
+        payload = {
+            "model": self._MODEL,
+            "max_tokens": self._MAX_TOKENS,
+            "temperature": 0.0,          # deterministic output
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": _build_prompt(candidates, context)},
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._TIMEOUT) as client:
+                resp = await client.post(self._URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            text = data["choices"][0]["message"]["content"]
+            result = self._parse_json_response(text)
+            if result:
+                log.info(f"Groq selected driver: {result.get('selected_driver_id')}")
+            return result
+        except Exception as e:
+            log.warning(f"GroqProvider failed: {e}")
+            return None
+
+
+# ── Gemini provider (backup — generous free tier) ────────────────────────────
+# Free tier: 1500 req/day, 15 RPM on gemini-1.5-flash
+# Sign up: https://aistudio.google.com/app/apikey
+
+class GeminiProvider(LLMProvider):
+    _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    _MODEL = "gemini-1.5-flash"
+    _TIMEOUT = 8.0
+    _MAX_TOKENS = 150
+
+    @property
+    def name(self) -> str:
+        return "gemini/gemini-1.5-flash"
+
+    @property
+    def available(self) -> bool:
+        return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+    async def select_driver(self, candidates: list[dict], context: dict) -> dict | None:
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            return None
+
+        url = f"{self._BASE_URL}/{self._MODEL}:generateContent?key={api_key}"
+        full_prompt = f"{_SYSTEM_PROMPT}\n\n{_build_prompt(candidates, context)}"
+        payload = {
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": self._MAX_TOKENS,
+                "temperature": 0.0,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            result = self._parse_json_response(text)
+            if result:
+                log.info(f"Gemini selected driver: {result.get('selected_driver_id')}")
+            return result
+        except Exception as e:
+            log.warning(f"GeminiProvider failed: {e}")
+            return None
+
+
+# ── Smart Router — tries providers in priority order ─────────────────────────
+
+class LLMRouter:
+    """
+    Tries LLM providers in priority order.
+    Falls back to rule-based scoring if all providers fail or are unavailable.
+
+    Priority:
+        1. Groq    (fastest, best free tier latency)
+        2. Gemini  (generous daily quota)
+        3. Fallback scoring (zero cost, always works)
+    """
+
+    def __init__(self):
+        self._providers: list[LLMProvider] = [
+            GroqProvider(),
+            GeminiProvider(),
+        ]
+
+    @property
+    def active_provider_names(self) -> list[str]:
+        return [p.name for p in self._providers if p.available]
+
+    async def select_driver(
+        self,
+        candidates: list[dict],
+        context: dict,
+    ) -> tuple[dict | None, str | None]:
+        """
+        Returns (llm_result, provider_name_used) or (None, None) if all fail.
+        """
+        for provider in self._providers:
+            if not provider.available:
+                log.debug(f"LLMRouter: {provider.name} skipped (no API key)")
+                continue
+            try:
+                result = await provider.select_driver(candidates, context)
+                if result:
+                    return result, provider.name
+                log.warning(f"LLMRouter: {provider.name} returned empty — trying next")
+            except Exception as e:
+                log.warning(f"LLMRouter: {provider.name} exception — {e}")
+
+        return None, None
+
+
+# Singleton router instance
+_llm_router = LLMRouter()
+
+
+# ── Rule-based fallback scorer (unchanged from original) ─────────────────────
 
 def _fallback_score(c: dict) -> float:
     """
-    Backup scorer that mirrors the old UtilityAgent weights when LLM unavailable:
-    proximity(40%) + quality(25%) + reliability(20%) + response(15%)
+    Rule-based scoring used when no LLM provider is available.
+    Weights: proximity(40%) + quality(25%) + reliability(20%) + response(15%)
     """
     eta_score    = max(0.0, 1.0 - c["eta_min"] / 30.0)
     rating_score = (c["rating"] - 1.0) / 4.0
@@ -731,24 +885,27 @@ def _fallback_score(c: dict) -> float:
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLM Driver Agent  —  API-compatible drop-in for old Anthropic-based agent
+# ══════════════════════════════════════════════════════════════════════════════
+
 class LLMDriverAgent:
     """
-    Exact drop-in replacement for the old UtilityAgent.
-    Applies the same pre-filtering & exclusion logic, then delegates
-    the final selection to the LLM (or fallback scoring if LLM unavailable).
+    Drop-in replacement for the original Anthropic-backed agent.
+    Applies identical pre-filtering and exclusion logic; delegates final
+    selection to LLMRouter (Groq → Gemini → fallback scoring).
     """
-    MAX_CANDIDATES = 5
+    MAX_CANDIDATES = 5      # top-N sent to LLM (keeps tokens minimal)
     MAX_DIST_KM    = 20.0
 
     @classmethod
     def _pre_filter_and_enrich(cls, drivers: list[dict], user_lat: float, user_lon: float) -> list[dict]:
         """
-        Same exclusion rules as old UtilityAgent.compute_utility:
+        Same exclusion rules as original:
           • Skip blacklisted drivers
           • Skip drivers beyond MAX_DIST_KM
           • Skip drivers where reliability == 0
-        Enriches each surviving driver with computed fields.
-        Sorted by ETA asc → top MAX_CANDIDATES forwarded to LLM.
+        Sorts by ETA, forwards top MAX_CANDIDATES to LLM.
         """
         now = time.time()
         enriched = []
@@ -790,7 +947,7 @@ class LLMDriverAgent:
         demand_factor: float,
     ) -> tuple[dict, dict]:
         """
-        Returns (best_candidate, agent_meta).
+        Returns (best_candidate, agent_meta) — identical signature to original.
         """
         candidates = cls._pre_filter_and_enrich(drivers, user_lat, user_lon)
 
@@ -803,7 +960,8 @@ class LLMDriverAgent:
             "demand_factor": demand_factor,
         }
 
-        llm_result = await _call_llm(candidates, context)
+        # ── Try LLM providers via smart router ───────────────────────────────
+        llm_result, provider_used = await _llm_router.select_driver(candidates, context)
 
         if llm_result:
             chosen_id = llm_result.get("selected_driver_id")
@@ -811,12 +969,13 @@ class LLMDriverAgent:
             if matched:
                 return matched, {
                     "method":               "llm_agent",
-                    "model":                _LLM_MODEL,
+                    "model":                provider_used,
                     "reason":               llm_result.get("reason", ""),
                     "candidates_evaluated": len(candidates),
                 }
-            log.warning(f"LLM returned unknown driver_id={chosen_id}, falling back")
+            log.warning(f"LLM returned unknown driver_id={chosen_id}, falling back to scoring")
 
+        # ── Fallback: pure rule-based scoring ────────────────────────────────
         best = max(candidates, key=_fallback_score)
         return best, {
             "method":               "fallback_scoring",
@@ -921,8 +1080,8 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
 
 app = FastAPI(
     title="Elite LLM Agent",
-    version="3.0.0",
-    description="LLM-powered driver selection — كل وظائف النظام الأصلي + LLM agent",
+    version="4.0.0",
+    description="Multi-provider free-tier LLM driver selection — Groq → Gemini → Fallback",
 )
 
 app.add_middleware(
@@ -937,15 +1096,17 @@ app.add_middleware(
 
 @app.get("/", tags=["health"])
 def health():
+    active = _llm_router.active_provider_names
     return {
-        "status": "ok",
-        "service": "Elite LLM Agent",
-        "version": "3.0.0",
-        "agent_mode": "llm" if ANTHROPIC_API_KEY else "fallback_only",
-        "llm_model": _LLM_MODEL,
-        "time_cairo": ContextAnalyser.now_cairo().isoformat(),
-        "is_rush_hour": ContextAnalyser.is_rush_hour(),
-        "is_late_night": ContextAnalyser.is_late_night(),
+        "status":           "ok",
+        "service":          "Elite LLM Agent",
+        "version":          "4.0.0",
+        "agent_mode":       "llm" if active else "fallback_only",
+        "active_providers": active,
+        "provider_priority":["groq/llama-3.1-8b-instant", "gemini/gemini-1.5-flash", "fallback_scoring"],
+        "time_cairo":       ContextAnalyser.now_cairo().isoformat(),
+        "is_rush_hour":     ContextAnalyser.is_rush_hour(),
+        "is_late_night":    ContextAnalyser.is_late_night(),
     }
 
 
@@ -964,24 +1125,24 @@ async def get_route(req: RouteRequest):
 
     return {
         "route": {
-            "distance_km": route.distance_km,
+            "distance_km":  route.distance_km,
             "duration_min": route.duration_min,
-            "geometry": route.geometry,
-            "source": route.source,
+            "geometry":     route.geometry,
+            "source":       route.source,
         },
         "pricing": {
-            "final_price": pricing.final_price,
-            "driver_earnings": pricing.driver_earnings,
-            "is_surge": pricing.is_surge,
+            "final_price":      pricing.final_price,
+            "driver_earnings":  pricing.driver_earnings,
+            "is_surge":         pricing.is_surge,
             "surge_multiplier": pricing.surge_multiplier,
-            "surge_reason": pricing.surge_reason,
+            "surge_reason":     pricing.surge_reason,
             "breakdown": {
-                "base_fare": pricing.base_fare,
-                "distance_cost": pricing.distance_cost,
-                "time_cost": pricing.time_cost,
+                "base_fare":      pricing.base_fare,
+                "distance_cost":  pricing.distance_cost,
+                "time_cost":      pricing.time_cost,
                 "fuel_component": pricing.fuel_component,
-                "service_fee": pricing.service_fee,
-                "subtotal": pricing.subtotal,
+                "service_fee":    pricing.service_fee,
+                "subtotal":       pricing.subtotal,
             },
         },
     }
@@ -1005,23 +1166,23 @@ async def price_estimate(req: PriceEstimateRequest):
             log.warning(f"Firestore update failed: {e}")
 
     return {
-        "final_price": pricing.final_price,
-        "driver_earnings": pricing.driver_earnings,
-        "is_surge": pricing.is_surge,
+        "final_price":      pricing.final_price,
+        "driver_earnings":  pricing.driver_earnings,
+        "is_surge":         pricing.is_surge,
         "surge_multiplier": pricing.surge_multiplier,
-        "surge_reason": pricing.surge_reason,
-        "distance_km": pricing.distance_km,
-        "duration_min": pricing.duration_min,
+        "surge_reason":     pricing.surge_reason,
+        "distance_km":      pricing.distance_km,
+        "duration_min":     pricing.duration_min,
         "breakdown": {
-            "base_fare": pricing.base_fare,
-            "distance_cost": pricing.distance_cost,
-            "time_cost": pricing.time_cost,
+            "base_fare":      pricing.base_fare,
+            "distance_cost":  pricing.distance_cost,
+            "time_cost":      pricing.time_cost,
             "fuel_component": pricing.fuel_component,
-            "service_fee": pricing.service_fee,
-            "subtotal": pricing.subtotal,
+            "service_fee":    pricing.service_fee,
+            "subtotal":       pricing.subtotal,
         },
-        "route_source": pricing.source,
-        "firestore_updated": bool(req.trip_id),
+        "route_source":       pricing.source,
+        "firestore_updated":  bool(req.trip_id),
     }
 
 
@@ -1031,8 +1192,8 @@ async def geocode_address(req: GeocodeRequest):
     return {
         "lat": result.lat, "lon": result.lon,
         "display_name": result.display_name,
-        "place_type": result.place_type,
-        "confidence": result.confidence,
+        "place_type":   result.place_type,
+        "confidence":   result.confidence,
     }
 
 
@@ -1041,9 +1202,9 @@ async def reverse_geocode(req: ReverseGeocodeRequest):
     result = await GeocodingEngine.reverse_geocode(req.lat, req.lon)
     return {
         "display_name": result.display_name,
-        "place_type": result.place_type,
-        "lat": result.lat,
-        "lon": result.lon,
+        "place_type":   result.place_type,
+        "lat":          result.lat,
+        "lon":          result.lon,
     }
 
 
@@ -1054,7 +1215,7 @@ async def batch_geocode(req: BatchGeocodeRequest):
         try:
             geo = await GeocodingEngine.geocode(address)
             results.append({
-                "address": address, "lat": geo.lat, "lon": geo.lon,
+                "address":      address, "lat": geo.lat, "lon": geo.lon,
                 "display_name": geo.display_name, "confidence": geo.confidence, "status": "ok",
             })
         except HTTPException as e:
@@ -1067,15 +1228,15 @@ async def batch_geocode(req: BatchGeocodeRequest):
 def get_pricing_config():
     cfg = PRICING
     return {
-        "base_fare_egp": cfg.base_fare_egp,
-        "per_km_fare_egp": cfg.per_km_fare_egp,
-        "per_minute_fare_egp": cfg.per_minute_fare_egp,
-        "minimum_fare_egp": cfg.minimum_fare_egp,
-        "service_fee_egp": cfg.service_fee_egp,
-        "platform_commission_pct": cfg.platform_commission * 100,
-        "fuel_price_per_liter_egp": cfg.fuel_price_per_liter_egp,
+        "base_fare_egp":              cfg.base_fare_egp,
+        "per_km_fare_egp":            cfg.per_km_fare_egp,
+        "per_minute_fare_egp":        cfg.per_minute_fare_egp,
+        "minimum_fare_egp":           cfg.minimum_fare_egp,
+        "service_fee_egp":            cfg.service_fee_egp,
+        "platform_commission_pct":    cfg.platform_commission * 100,
+        "fuel_price_per_liter_egp":   cfg.fuel_price_per_liter_egp,
         "surge_late_night_bonus_pct": cfg.late_night_bonus * 100,
-        "surge_rush_hour_bonus_pct": cfg.rush_hour_bonus * 100,
+        "surge_rush_hour_bonus_pct":  cfg.rush_hour_bonus * 100,
     }
 
 
@@ -1133,7 +1294,6 @@ async def match_driver(req: MatchRequest):
 
     demand_factor = ContextAnalyser.get_demand_factor(req.user_lat, req.user_lon)
 
-    # نفس منطق wait_seconds الأصلي
     wait_seconds = 0.0
     if req.trip_id:
         try:
@@ -1145,7 +1305,6 @@ async def match_driver(req: MatchRequest):
         except Exception:
             pass
 
-    # LLM Agent يختار أفضل سائق بدل UtilityAgent
     best, agent_meta = await LLMDriverAgent.select_best(
         drivers, req.user_lat, req.user_lon, demand_factor
     )
@@ -1328,14 +1487,14 @@ async def driver_stats(driver_id: str):
     blacklist_until = data.get("blacklist_until", 0)
 
     return {
-        "driver_id":        driver_id,
-        "name":             data.get("name", "سائق"),
-        "rating":           data.get("rating", 5.0),
-        "trips_count":      data.get("trips_count", 0),
-        "trips_count_today":data.get("trips_count_today", 0),
-        "total_earnings":   data.get("total_earnings", 0.0),
-        "is_available":     data.get("is_available", False),
-        "profile_complete": data.get("profile_complete", False),
+        "driver_id":         driver_id,
+        "name":              data.get("name", "سائق"),
+        "rating":            data.get("rating", 5.0),
+        "trips_count":       data.get("trips_count", 0),
+        "trips_count_today": data.get("trips_count_today", 0),
+        "total_earnings":    data.get("total_earnings", 0.0),
+        "is_available":      data.get("is_available", False),
+        "profile_complete":  data.get("profile_complete", False),
         "agent_scores": {
             "reliability":    ReliabilityScorer.get_score(data),
             "responsiveness": ResponsivenessScorer.get_score(data),
