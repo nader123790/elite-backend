@@ -24,7 +24,7 @@ from firebase_admin import credentials, firestore
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  إعداد الـ Logger
+#  Logger
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -274,7 +274,6 @@ class RouteEngine:
         if cached:
             return RouteResult(**cached)
 
-        # OSRM (مجاني)
         try:
             result = await cls._fetch_osrm(origin_lat, origin_lon, dest_lat, dest_lon)
         except Exception as e:
@@ -350,7 +349,6 @@ class GeocodingEngine:
         cached = GeoCache.get_geocode(key)
         if cached:
             return GeocodeResult(**cached)
-
         result = await cls._nominatim_forward(address)
         GeoCache.set_geocode(key, result.__dict__)
         return result
@@ -361,14 +359,12 @@ class GeocodingEngine:
         cached = GeoCache.get_geocode(key)
         if cached:
             return GeocodeResult(**cached)
-
         result = await cls._nominatim_reverse(lat, lon)
         GeoCache.set_geocode(key, result.__dict__)
         return result
 
     @classmethod
     async def _nominatim_forward(cls, address: str) -> GeocodeResult:
-        # أول بحث مقيّد بمصر
         params = {
             "q": address, "format": "jsonv2", "limit": 1,
             "viewbox": cls._EGYPT_VIEWBOX, "bounded": 1, "addressdetails": 1,
@@ -379,7 +375,6 @@ class GeocodingEngine:
                 resp.raise_for_status()
                 results = resp.json()
 
-            # لو ملقاش نتيجة، ابحث بدون تقييد
             if not results:
                 params.pop("viewbox"), params.pop("bounded")
                 async with httpx.AsyncClient(headers=cls._HEADERS, timeout=cls._TIMEOUT) as client:
@@ -456,7 +451,10 @@ class TripPricingEngine:
         distance_cost = round(route.distance_km * cfg.per_km_fare_egp, 2)
         time_cost = round(route.duration_min * cfg.per_minute_fare_egp, 2)
         service_fee = cfg.service_fee_egp
-        fuel_component = round((route.distance_km / 100) * cfg.fuel_consumption_per_100km * cfg.fuel_price_per_liter_egp * cfg.fuel_cost_coverage_ratio, 2)
+        fuel_component = round(
+            (route.distance_km / 100) * cfg.fuel_consumption_per_100km
+            * cfg.fuel_price_per_liter_egp * cfg.fuel_cost_coverage_ratio, 2
+        )
         subtotal = round(base_fare + distance_cost + time_cost + fuel_component + service_fee, 2)
 
         multiplier, surge_reason = cls._compute_surge(demand_factor, is_rush, is_night)
@@ -531,42 +529,20 @@ class ContextAnalyser:
     def get_demand_factor(cls, user_lat, user_lon, radius_km=3.0):
         try:
             trip_docs = db.collection("trips").where("status", "in", ["searching", "matched"]).limit(50).stream()
-            demand = sum(1 for doc in trip_docs if _haversine(user_lat, user_lon, doc.to_dict().get("user_lat", 0), doc.to_dict().get("user_lon", 0)) <= radius_km)
-
+            demand = sum(
+                1 for doc in trip_docs
+                if _haversine(user_lat, user_lon, doc.to_dict().get("user_lat", 0), doc.to_dict().get("user_lon", 0)) <= radius_km
+            )
             driver_docs = db.collection("users").where("role", "==", "driver").where("is_available", "==", True).limit(50).stream()
-            supply = sum(1 for doc in driver_docs if _haversine(user_lat, user_lon, doc.to_dict().get("lat", 0), doc.to_dict().get("lon", 0)) <= radius_km)
-
+            supply = sum(
+                1 for doc in driver_docs
+                if _haversine(user_lat, user_lon, doc.to_dict().get("lat", 0), doc.to_dict().get("lon", 0)) <= radius_km
+            )
             if supply == 0:
                 return 3.0
             return round(demand / supply, 2)
         except Exception:
             return 1.0
-
-    @classmethod
-    def compute_dynamic_weights(cls, demand_factor, wait_seconds=0):
-        base = {
-            "w_proximity": 0.40, "w_quality": 0.25,
-            "w_availability": 0.15, "w_reliability": 0.12, "w_speed": 0.08,
-        }
-        if cls.is_rush_hour():
-            base["w_proximity"] += 0.08
-            base["w_quality"] -= 0.05
-            base["w_availability"] -= 0.03
-        if cls.is_late_night():
-            base["w_reliability"] += 0.08
-            base["w_proximity"] -= 0.05
-            base["w_quality"] += 0.02
-        if demand_factor > 1.5:
-            base["w_availability"] += 0.10
-            base["w_proximity"] -= 0.05
-            base["w_quality"] -= 0.05
-        if wait_seconds > 120:
-            base["w_speed"] += 0.10
-            base["w_quality"] -= 0.05
-            base["w_availability"] -= 0.05
-
-        total = sum(base.values())
-        return {k: round(v / total, 4) for k, v in base.items()}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -596,73 +572,6 @@ class ResponsivenessScorer:
         elif avg <= 90: return 0.65
         elif avg <= 150: return 0.40
         else: return 0.20
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Utility Agent
-# ──────────────────────────────────────────────────────────────────────────────
-
-class UtilityAgent:
-    MAX_TRIPS_PER_DAY = 40
-    MAX_PROXIMITY_DIST = 20.0
-
-    @classmethod
-    def compute_utility(cls, driver: dict, user_lat, user_lon, weights: dict) -> dict:
-        dist = _haversine(user_lat, user_lon, float(driver.get("lat", user_lat)), float(driver.get("lon", user_lon)))
-        if dist > cls.MAX_PROXIMITY_DIST:
-            return {"total": -1.0, "dist_km": dist, "excluded": "too_far"}
-
-        f1 = round(math.exp(-0.3 * dist), 4)
-        rating = float(driver.get("rating", 4.5))
-        normalized = (rating - 1.0) / 4.0
-        if rating < 3.5:
-            normalized *= 0.5
-        f2 = round(min(normalized, 1.0), 4)
-        f3 = round(1.0 - min(int(driver.get("trips_count_today", 0)), cls.MAX_TRIPS_PER_DAY) / cls.MAX_TRIPS_PER_DAY, 4)
-        f4 = ReliabilityScorer.get_score(driver)
-        f5 = ResponsivenessScorer.get_score(driver)
-
-        if f4 == 0.0:
-            return {"total": -1.0, "dist_km": dist, "excluded": "blacklisted"}
-
-        total = (
-            weights["w_proximity"] * f1 + weights["w_quality"] * f2 +
-            weights["w_availability"] * f3 + weights["w_reliability"] * f4 + weights["w_speed"] * f5
-        )
-        return {
-            "total": round(total, 6), "dist_km": round(dist, 2),
-            "scores": {"proximity": f1, "quality": f2, "availability": f3, "reliability": f4, "speed": f5},
-        }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Surge Pricing Engine (بسيط - للـ match-driver)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class SurgePricingEngine:
-    BASE_FARE = 15.0
-    PER_KM_FARE = 8.0
-
-    @classmethod
-    def calculate_price(cls, dist_km, demand_factor) -> dict:
-        base_price = cls.BASE_FARE + dist_km * cls.PER_KM_FARE
-        if demand_factor <= 0.5: multiplier = 0.9
-        elif demand_factor <= 1.0: multiplier = 1.0
-        elif demand_factor <= 1.5: multiplier = 1.2
-        elif demand_factor <= 2.0: multiplier = 1.5
-        elif demand_factor <= 3.0: multiplier = 1.8
-        else: multiplier = 2.2
-
-        if _is_late_night():
-            multiplier += 0.1
-
-        return {
-            "base_price": round(base_price, 0),
-            "multiplier": round(multiplier, 2),
-            "final_price": round(base_price * multiplier, 0),
-            "demand_factor": demand_factor,
-            "is_surge": multiplier > 1.0,
-        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -697,15 +606,236 @@ class BlacklistManager:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Map Generator (OpenStreetMap + Folium - مجاني 100%)
+#  Surge Pricing Engine
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SurgePricingEngine:
+    BASE_FARE = 15.0
+    PER_KM_FARE = 8.0
+
+    @classmethod
+    def calculate_price(cls, dist_km, demand_factor) -> dict:
+        base_price = cls.BASE_FARE + dist_km * cls.PER_KM_FARE
+        if demand_factor <= 0.5: multiplier = 0.9
+        elif demand_factor <= 1.0: multiplier = 1.0
+        elif demand_factor <= 1.5: multiplier = 1.2
+        elif demand_factor <= 2.0: multiplier = 1.5
+        elif demand_factor <= 3.0: multiplier = 1.8
+        else: multiplier = 2.2
+
+        if _is_late_night():
+            multiplier += 0.1
+
+        return {
+            "base_price": round(base_price, 0),
+            "multiplier": round(multiplier, 2),
+            "final_price": round(base_price * multiplier, 0),
+            "demand_factor": demand_factor,
+            "is_surge": multiplier > 1.0,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLM DRIVER AGENT  —  بديل كامل لـ UtilityAgent
+# ══════════════════════════════════════════════════════════════════════════════
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+_LLM_URL    = "https://api.anthropic.com/v1/messages"
+_LLM_MODEL  = "claude-haiku-4-5-20251001"
+_LLM_TOKENS = 200
+
+_SELECT_DRIVER_TOOL = {
+    "name": "select_driver",
+    "description": "Select the single best driver from the candidates list.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "selected_driver_id": {
+                "type": "string",
+                "description": "The _id of the chosen driver",
+            },
+            "reason": {
+                "type": "string",
+                "description": "One or two sentences max explaining the choice",
+            },
+        },
+        "required": ["selected_driver_id", "reason"],
+    },
+}
+
+_SYSTEM_PROMPT = (
+    "You are a ride-hailing dispatcher. "
+    "Given a list of available drivers and trip context, call select_driver with the best choice. "
+    "Priority order: lowest ETA → highest rating → highest reliability. "
+    "Never pick a blacklisted driver. Keep reason under 2 sentences."
+)
+
+
+def _build_llm_prompt(candidates: list[dict], context: dict) -> str:
+    ctx = (
+        f"rush_hour={context['rush_hour']},"
+        f"late_night={context['late_night']},"
+        f"demand={context['demand_factor']}"
+    )
+    rows = "\n".join(
+        f"id={c['id']},dist={c['dist_km']}km,eta={c['eta_min']}min,"
+        f"rating={c['rating']},reliability={c['reliability']},response={c['response_score']}"
+        for c in candidates
+    )
+    return f"context:{ctx}\ncandidates:\n{rows}"
+
+
+async def _call_llm(candidates: list[dict], context: dict) -> dict | None:
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    payload = {
+        "model": _LLM_MODEL,
+        "max_tokens": _LLM_TOKENS,
+        "system": _SYSTEM_PROMPT,
+        "tools": [_SELECT_DRIVER_TOOL],
+        "tool_choice": {"type": "any"},
+        "messages": [{"role": "user", "content": _build_llm_prompt(candidates, context)}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(_LLM_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        for block in data.get("content", []):
+            if block.get("type") == "tool_use" and block.get("name") == "select_driver":
+                return block["input"]
+        return None
+    except Exception as e:
+        log.warning(f"LLM call failed: {e}")
+        return None
+
+
+def _fallback_score(c: dict) -> float:
+    """
+    Backup scorer that mirrors the old UtilityAgent weights when LLM unavailable:
+    proximity(40%) + quality(25%) + reliability(20%) + response(15%)
+    """
+    eta_score    = max(0.0, 1.0 - c["eta_min"] / 30.0)
+    rating_score = (c["rating"] - 1.0) / 4.0
+    return (
+        0.40 * eta_score
+        + 0.25 * rating_score
+        + 0.20 * c["reliability"]
+        + 0.15 * c["response_score"]
+    )
+
+
+class LLMDriverAgent:
+    """
+    Exact drop-in replacement for the old UtilityAgent.
+    Applies the same pre-filtering & exclusion logic, then delegates
+    the final selection to the LLM (or fallback scoring if LLM unavailable).
+    """
+    MAX_CANDIDATES = 5
+    MAX_DIST_KM    = 20.0
+
+    @classmethod
+    def _pre_filter_and_enrich(cls, drivers: list[dict], user_lat: float, user_lon: float) -> list[dict]:
+        """
+        Same exclusion rules as old UtilityAgent.compute_utility:
+          • Skip blacklisted drivers
+          • Skip drivers beyond MAX_DIST_KM
+          • Skip drivers where reliability == 0
+        Enriches each surviving driver with computed fields.
+        Sorted by ETA asc → top MAX_CANDIDATES forwarded to LLM.
+        """
+        now = time.time()
+        enriched = []
+        for d in drivers:
+            if now < d.get("blacklist_until", 0):
+                continue
+
+            dist = _haversine(
+                user_lat, user_lon,
+                float(d.get("lat", user_lat)),
+                float(d.get("lon", user_lon)),
+            )
+            if dist > cls.MAX_DIST_KM:
+                continue
+
+            reliability = ReliabilityScorer.get_score(d)
+            if reliability == 0.0:
+                continue
+
+            enriched.append({
+                "id":             d["_id"],
+                "dist_km":        round(dist, 2),
+                "eta_min":        _eta_minutes(dist),
+                "rating":         float(d.get("rating", 4.5)),
+                "reliability":    reliability,
+                "response_score": ResponsivenessScorer.get_score(d),
+                "_raw":           d,
+            })
+
+        enriched.sort(key=lambda x: x["eta_min"])
+        return enriched[: cls.MAX_CANDIDATES]
+
+    @classmethod
+    async def select_best(
+        cls,
+        drivers: list[dict],
+        user_lat: float,
+        user_lon: float,
+        demand_factor: float,
+    ) -> tuple[dict, dict]:
+        """
+        Returns (best_candidate, agent_meta).
+        """
+        candidates = cls._pre_filter_and_enrich(drivers, user_lat, user_lon)
+
+        if not candidates:
+            raise HTTPException(status_code=404, detail="no_drivers_available")
+
+        context = {
+            "rush_hour":     _is_rush_hour(),
+            "late_night":    _is_late_night(),
+            "demand_factor": demand_factor,
+        }
+
+        llm_result = await _call_llm(candidates, context)
+
+        if llm_result:
+            chosen_id = llm_result.get("selected_driver_id")
+            matched = next((c for c in candidates if c["id"] == chosen_id), None)
+            if matched:
+                return matched, {
+                    "method":               "llm_agent",
+                    "model":                _LLM_MODEL,
+                    "reason":               llm_result.get("reason", ""),
+                    "candidates_evaluated": len(candidates),
+                }
+            log.warning(f"LLM returned unknown driver_id={chosen_id}, falling back")
+
+        best = max(candidates, key=_fallback_score)
+        return best, {
+            "method":               "fallback_scoring",
+            "model":                None,
+            "reason":               (
+                f"ETA {best['eta_min']}min, "
+                f"rating {best['rating']}, "
+                f"reliability {round(best['reliability'], 2)}"
+            ),
+            "candidates_evaluated": len(candidates),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Map Generator (OpenStreetMap + Leaflet - مجاني 100%)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=None, driver_lat=None, driver_lon=None) -> str:
-    """يولد خريطة HTML باستخدام Leaflet.js + OpenStreetMap بدون API Key"""
-
-    # تحويل إحداثيات المسار لـ JS array
     if route_coords and len(route_coords) > 1:
-        # OSRM يرجع [lon, lat] - نقلبهم لـ [lat, lon] لـ Leaflet
         route_js = str([[c[1], c[0]] for c in route_coords])
     else:
         route_js = f"[[{origin_lat},{origin_lon}],[{dest_lat},{dest_lon}]]"
@@ -759,11 +889,9 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
     attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
   }}).addTo(map);
 
-  // رسم المسار
   var routeCoords = {route_js};
   L.polyline(routeCoords, {{color: '#2563eb', weight: 4, opacity: 0.8}}).addTo(map);
 
-  // أيقونة الانطلاق
   var startIcon = L.divIcon({{
     html: '<div style="font-size:28px;">📍</div>',
     iconAnchor: [14, 28], className: ''
@@ -771,7 +899,6 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
   L.marker([{origin_lat},{origin_lon}], {{icon: startIcon}})
     .addTo(map).bindPopup('نقطة الانطلاق');
 
-  // أيقونة الوجهة
   var endIcon = L.divIcon({{
     html: '<div style="font-size:28px;">🏁</div>',
     iconAnchor: [14, 28], className: ''
@@ -781,7 +908,6 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
 
   {driver_marker}
 
-  // تكبير الخريطة لتناسب المسار
   map.fitBounds(routeCoords);
 </script>
 </body>
@@ -794,9 +920,9 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
 # ──────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Elite Utility-Based Agent",
-    version="2.0.0",
-    description="AI Agent يختار أفضل سائق بناءً على utility function ديناميكية",
+    title="Elite LLM Agent",
+    version="3.0.0",
+    description="LLM-powered driver selection — كل وظائف النظام الأصلي + LLM agent",
 )
 
 app.add_middleware(
@@ -813,8 +939,10 @@ app.add_middleware(
 def health():
     return {
         "status": "ok",
-        "service": "Elite Utility-Based Agent",
-        "version": "2.0.0",
+        "service": "Elite LLM Agent",
+        "version": "3.0.0",
+        "agent_mode": "llm" if ANTHROPIC_API_KEY else "fallback_only",
+        "llm_model": _LLM_MODEL,
         "time_cairo": ContextAnalyser.now_cairo().isoformat(),
         "is_rush_hour": ContextAnalyser.is_rush_hour(),
         "is_late_night": ContextAnalyser.is_late_night(),
@@ -830,9 +958,9 @@ async def get_route(req: RouteRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"خطأ في حساب المسار: {e}")
 
-    is_rush = _is_rush_hour()
+    is_rush  = _is_rush_hour()
     is_night = _is_late_night()
-    pricing = TripPricingEngine.calculate(route, req.demand_factor, is_rush, is_night)
+    pricing  = TripPricingEngine.calculate(route, req.demand_factor, is_rush, is_night)
 
     return {
         "route": {
@@ -848,9 +976,12 @@ async def get_route(req: RouteRequest):
             "surge_multiplier": pricing.surge_multiplier,
             "surge_reason": pricing.surge_reason,
             "breakdown": {
-                "base_fare": pricing.base_fare, "distance_cost": pricing.distance_cost,
-                "time_cost": pricing.time_cost, "fuel_component": pricing.fuel_component,
-                "service_fee": pricing.service_fee, "subtotal": pricing.subtotal,
+                "base_fare": pricing.base_fare,
+                "distance_cost": pricing.distance_cost,
+                "time_cost": pricing.time_cost,
+                "fuel_component": pricing.fuel_component,
+                "service_fee": pricing.service_fee,
+                "subtotal": pricing.subtotal,
             },
         },
     }
@@ -882,9 +1013,12 @@ async def price_estimate(req: PriceEstimateRequest):
         "distance_km": pricing.distance_km,
         "duration_min": pricing.duration_min,
         "breakdown": {
-            "base_fare": pricing.base_fare, "distance_cost": pricing.distance_cost,
-            "time_cost": pricing.time_cost, "fuel_component": pricing.fuel_component,
-            "service_fee": pricing.service_fee, "subtotal": pricing.subtotal,
+            "base_fare": pricing.base_fare,
+            "distance_cost": pricing.distance_cost,
+            "time_cost": pricing.time_cost,
+            "fuel_component": pricing.fuel_component,
+            "service_fee": pricing.service_fee,
+            "subtotal": pricing.subtotal,
         },
         "route_source": pricing.source,
         "firestore_updated": bool(req.trip_id),
@@ -908,7 +1042,8 @@ async def reverse_geocode(req: ReverseGeocodeRequest):
     return {
         "display_name": result.display_name,
         "place_type": result.place_type,
-        "lat": result.lat, "lon": result.lon,
+        "lat": result.lat,
+        "lon": result.lon,
     }
 
 
@@ -924,7 +1059,7 @@ async def batch_geocode(req: BatchGeocodeRequest):
             })
         except HTTPException as e:
             results.append({"address": address, "status": "error", "detail": e.detail})
-        await asyncio.sleep(0.25)  # Nominatim rate limit
+        await asyncio.sleep(0.25)
     return {"results": results, "count": len(results)}
 
 
@@ -944,12 +1079,10 @@ def get_pricing_config():
     }
 
 
-# عرض الخريطة
 @app.post("/geo/map", tags=["geo"])
 async def get_trip_map(req: MapRequest):
-    """يرجع صفحة HTML فيها خريطة OpenStreetMap للرحلة - مجانية بالكامل"""
     try:
-        route = await RouteEngine.get_route(req.origin_lat, req.origin_lon, req.dest_lat, req.dest_lon)
+        route  = await RouteEngine.get_route(req.origin_lat, req.origin_lon, req.dest_lat, req.dest_lon)
         coords = route.geometry
     except Exception:
         coords = None
@@ -968,14 +1101,13 @@ async def get_trip_map(req: MapRequest):
 async def get_map_simple(
     origin_lat: float = Query(...),
     origin_lon: float = Query(...),
-    dest_lat: float = Query(...),
-    dest_lon: float = Query(...),
+    dest_lat:   float = Query(...),
+    dest_lon:   float = Query(...),
     driver_lat: float | None = Query(default=None),
     driver_lon: float | None = Query(default=None),
 ):
-    """GET version من خريطة الرحلة - سهل تفتحه في المتصفح مباشرة"""
     try:
-        route = await RouteEngine.get_route(origin_lat, origin_lon, dest_lat, dest_lon)
+        route  = await RouteEngine.get_route(origin_lat, origin_lon, dest_lat, dest_lon)
         coords = route.geometry
     except Exception:
         coords = None
@@ -984,18 +1116,24 @@ async def get_map_simple(
     return HTMLResponse(content=html)
 
 
-# ── Match Driver ──────────────────────────────────────────────────────────────
+# ── Match Driver — LLM Agent ──────────────────────────────────────────────────
 
 @app.post("/match-driver", tags=["agent"])
 async def match_driver(req: MatchRequest):
-    # جلب السائقين المتاحين
     try:
         docs = db.collection("users").where("role", "==", "driver").where("is_available", "==", True).stream()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Firestore error: {e}")
 
+    drivers = []
+    for doc in docs:
+        d = doc.to_dict()
+        d["_id"] = doc.id
+        drivers.append(d)
+
     demand_factor = ContextAnalyser.get_demand_factor(req.user_lat, req.user_lon)
 
+    # نفس منطق wait_seconds الأصلي
     wait_seconds = 0.0
     if req.trip_id:
         try:
@@ -1007,77 +1145,66 @@ async def match_driver(req: MatchRequest):
         except Exception:
             pass
 
-    weights = ContextAnalyser.compute_dynamic_weights(demand_factor, wait_seconds)
+    # LLM Agent يختار أفضل سائق بدل UtilityAgent
+    best, agent_meta = await LLMDriverAgent.select_best(
+        drivers, req.user_lat, req.user_lon, demand_factor
+    )
 
-    # حساب utility لكل سائق
-    candidates = []
-    for doc in docs:
-        data = doc.to_dict()
-        data["_id"] = doc.id
-        util = UtilityAgent.compute_utility(data, req.user_lat, req.user_lon, weights)
-        if util["total"] < 0:
-            continue
-        data["_utility"] = util
-        candidates.append(data)
-
-    if not candidates:
-        raise HTTPException(status_code=404, detail="no_drivers_available")
-
-    candidates.sort(key=lambda x: x["_utility"]["total"], reverse=True)
-    best = candidates[0]
-    util_result = best["_utility"]
-
-    dist_km = util_result["dist_km"]
+    raw     = best["_raw"]
+    dist_km = best["dist_km"]
+    eta     = best["eta_min"]
     pricing = SurgePricingEngine.calculate_price(dist_km, demand_factor)
-    eta = _eta_minutes(dist_km)
 
     if req.trip_id:
         try:
             db.collection("trips").document(req.trip_id).update({
-                "driver_id": best["_id"],
-                "driver_name": best.get("name", "سائق"),
-                "driver_phone": best.get("phone", ""),
-                "driver_lat": best.get("lat"),
-                "driver_lon": best.get("lon"),
-                "driver_rating": best.get("rating", 5.0),
-                "driver_car": f"{best.get('car_brand','')} {best.get('car_model','')}".strip() or best.get("car", "سيارة"),
-                "driver_car_color": best.get("car_color", ""),
-                "driver_plate": best.get("plate_number", best.get("plate", "")),
-                "driver_photo_url": best.get("profile_photo_url", ""),
-                "distance_km": dist_km,
-                "eta_min": eta,
-                "estimated_price": pricing["final_price"],
+                "driver_id":        best["id"],
+                "driver_name":      raw.get("name", "سائق"),
+                "driver_phone":     raw.get("phone", ""),
+                "driver_lat":       raw.get("lat"),
+                "driver_lon":       raw.get("lon"),
+                "driver_rating":    raw.get("rating", 5.0),
+                "driver_car":       f"{raw.get('car_brand','')} {raw.get('car_model','')}".strip() or raw.get("car", "سيارة"),
+                "driver_car_color": raw.get("car_color", ""),
+                "driver_plate":     raw.get("plate_number", raw.get("plate", "")),
+                "driver_photo_url": raw.get("profile_photo_url", ""),
+                "distance_km":      dist_km,
+                "eta_min":          eta,
+                "estimated_price":  pricing["final_price"],
                 "surge_multiplier": pricing["multiplier"],
-                "is_surge": pricing["is_surge"],
-                "status": "matched",
-                "matched_at": firestore.SERVER_TIMESTAMP,
+                "is_surge":         pricing["is_surge"],
+                "status":           "matched",
+                "matched_at":       firestore.SERVER_TIMESTAMP,
+                "agent_method":     agent_meta["method"],
             })
         except Exception as e:
             log.warning(f"Firestore update error: {e}")
 
     return {
         "matched_driver": {
-            "driver_id": best["_id"],
-            "name": best.get("name", "سائق"),
-            "phone": best.get("phone", ""),
-            "rating": best.get("rating", 5.0),
-            "car": f"{best.get('car_brand','')} {best.get('car_model','')}".strip() or best.get("car", "سيارة"),
-            "car_color": best.get("car_color", ""),
-            "plate": best.get("plate_number", best.get("plate", "")),
-            "photo_url": best.get("profile_photo_url", ""),
-            "lat": best.get("lat"),
-            "lon": best.get("lon"),
+            "driver_id":   best["id"],
+            "name":        raw.get("name", "سائق"),
+            "phone":       raw.get("phone", ""),
+            "rating":      raw.get("rating", 5.0),
+            "car":         f"{raw.get('car_brand','')} {raw.get('car_model','')}".strip() or raw.get("car", "سيارة"),
+            "car_color":   raw.get("car_color", ""),
+            "plate":       raw.get("plate_number", raw.get("plate", "")),
+            "photo_url":   raw.get("profile_photo_url", ""),
+            "lat":         raw.get("lat"),
+            "lon":         raw.get("lon"),
             "distance_km": dist_km,
-            "eta_min": eta,
+            "eta_min":     eta,
         },
         "pricing": pricing,
         "agent_decision": {
-            "utility_score": util_result["total"],
-            "score_breakdown": util_result["scores"],
-            "weights_used": weights,
-            "demand_factor": demand_factor,
-            "is_rush_hour": ContextAnalyser.is_rush_hour(),
-            "candidates_count": len(candidates),
+            "method":               agent_meta["method"],
+            "model":                agent_meta.get("model"),
+            "reason":               agent_meta["reason"],
+            "candidates_evaluated": agent_meta["candidates_evaluated"],
+            "demand_factor":        demand_factor,
+            "is_rush_hour":         ContextAnalyser.is_rush_hour(),
+            "is_late_night":        ContextAnalyser.is_late_night(),
+            "wait_seconds":         round(wait_seconds),
         },
     }
 
@@ -1177,14 +1304,14 @@ async def rate_driver(req: RatingRequest):
 
     data = doc.to_dict()
     current_rating = float(data.get("rating", 5.0))
-    total_ratings = int(data.get("total_ratings", 1))
-    new_rating = round((current_rating * total_ratings + req.rating) / (total_ratings + 1), 2)
+    total_ratings  = int(data.get("total_ratings", 1))
+    new_rating     = round((current_rating * total_ratings + req.rating) / (total_ratings + 1), 2)
 
     driver_ref.update({"rating": new_rating, "total_ratings": total_ratings + 1})
     db.collection("trips").document(req.trip_id).update({
-        "user_rating": req.rating,
+        "user_rating":  req.rating,
         "user_comment": req.comment or "",
-        "rated_at": firestore.SERVER_TIMESTAMP,
+        "rated_at":     firestore.SERVER_TIMESTAMP,
     })
     return {"ok": True, "new_rating": new_rating, "total_ratings": total_ratings + 1}
 
@@ -1197,25 +1324,25 @@ async def driver_stats(driver_id: str):
     if not doc.exists:
         raise HTTPException(status_code=404, detail="driver_not_found")
 
-    data = doc.to_dict()
+    data            = doc.to_dict()
     blacklist_until = data.get("blacklist_until", 0)
 
     return {
-        "driver_id": driver_id,
-        "name": data.get("name", "سائق"),
-        "rating": data.get("rating", 5.0),
-        "trips_count": data.get("trips_count", 0),
-        "trips_count_today": data.get("trips_count_today", 0),
-        "total_earnings": data.get("total_earnings", 0.0),
-        "is_available": data.get("is_available", False),
+        "driver_id":        driver_id,
+        "name":             data.get("name", "سائق"),
+        "rating":           data.get("rating", 5.0),
+        "trips_count":      data.get("trips_count", 0),
+        "trips_count_today":data.get("trips_count_today", 0),
+        "total_earnings":   data.get("total_earnings", 0.0),
+        "is_available":     data.get("is_available", False),
         "profile_complete": data.get("profile_complete", False),
         "agent_scores": {
-            "reliability": ReliabilityScorer.get_score(data),
+            "reliability":    ReliabilityScorer.get_score(data),
             "responsiveness": ResponsivenessScorer.get_score(data),
         },
         "blacklisted_seconds_remaining": max(0, round(blacklist_until - time.time())),
-        "total_accepted": data.get("total_accepted", 0),
-        "total_rejected": data.get("total_rejected", 0),
+        "total_accepted":  data.get("total_accepted", 0),
+        "total_rejected":  data.get("total_rejected", 0),
         "total_cancelled": data.get("total_cancelled", 0),
     }
 
@@ -1225,16 +1352,16 @@ async def driver_stats(driver_id: str):
 @app.post("/surge-info", tags=["pricing"])
 async def get_surge_info(req: SurgePricingRequest):
     demand_factor = ContextAnalyser.get_demand_factor(req.lat, req.lon, req.radius_km)
-    pricing_5km = SurgePricingEngine.calculate_price(5.0, demand_factor)
-    pricing_10km = SurgePricingEngine.calculate_price(10.0, demand_factor)
+    pricing_5km   = SurgePricingEngine.calculate_price(5.0, demand_factor)
+    pricing_10km  = SurgePricingEngine.calculate_price(10.0, demand_factor)
 
     return {
-        "demand_factor": demand_factor,
-        "is_surge": pricing_5km["is_surge"],
+        "demand_factor":    demand_factor,
+        "is_surge":         pricing_5km["is_surge"],
         "surge_multiplier": pricing_5km["multiplier"],
-        "is_rush_hour": ContextAnalyser.is_rush_hour(),
-        "is_late_night": ContextAnalyser.is_late_night(),
-        "sample_prices": {"5km": pricing_5km["final_price"], "10km": pricing_10km["final_price"]},
+        "is_rush_hour":     ContextAnalyser.is_rush_hour(),
+        "is_late_night":    ContextAnalyser.is_late_night(),
+        "sample_prices":    {"5km": pricing_5km["final_price"], "10km": pricing_10km["final_price"]},
     }
 
 
@@ -1242,8 +1369,8 @@ async def get_surge_info(req: SurgePricingRequest):
 
 @app.get("/analytics/area", tags=["analytics"])
 async def area_analytics(
-    lat: float = Query(...),
-    lon: float = Query(...),
+    lat:       float = Query(...),
+    lon:       float = Query(...),
     radius_km: float = Query(default=5.0, ge=0.5, le=20.0),
 ):
     demand_factor = ContextAnalyser.get_demand_factor(lat, lon, radius_km)
@@ -1260,15 +1387,14 @@ async def area_analytics(
             })
 
     return {
-        "area_center": {"lat": lat, "lon": lon},
-        "radius_km": radius_km,
+        "area_center":       {"lat": lat, "lon": lon},
+        "radius_km":         radius_km,
         "available_drivers": len(available_drivers),
-        "drivers_list": available_drivers[:10],
-        "demand_factor": demand_factor,
-        "current_weights": ContextAnalyser.compute_dynamic_weights(demand_factor),
-        "is_rush_hour": ContextAnalyser.is_rush_hour(),
-        "is_late_night": ContextAnalyser.is_late_night(),
-        "surge_multiplier": SurgePricingEngine.calculate_price(5.0, demand_factor)["multiplier"],
+        "drivers_list":      available_drivers[:10],
+        "demand_factor":     demand_factor,
+        "is_rush_hour":      ContextAnalyser.is_rush_hour(),
+        "is_late_night":     ContextAnalyser.is_late_night(),
+        "surge_multiplier":  SurgePricingEngine.calculate_price(5.0, demand_factor)["multiplier"],
     }
 
 
@@ -1276,7 +1402,7 @@ async def area_analytics(
 
 @app.post("/trip/{trip_id}/cancel", tags=["trips"])
 async def cancel_trip(trip_id: str, cancelled_by: str = Query(default="user")):
-    ref = db.collection("trips").document(trip_id)
+    ref  = db.collection("trips").document(trip_id)
     trip = ref.get()
     if not trip.exists:
         raise HTTPException(status_code=404, detail="trip_not_found")
@@ -1301,9 +1427,9 @@ async def cancel_trip(trip_id: str, cancelled_by: str = Query(default="user")):
 @app.put("/driver/{driver_id}/location", tags=["tracking"])
 async def update_driver_location(
     driver_id: str,
-    lat: float = Query(...),
-    lon: float = Query(...),
-    trip_id: str | None = Query(default=None),
+    lat:       float = Query(...),
+    lon:       float = Query(...),
+    trip_id:   str | None = Query(default=None),
 ):
     db.collection("users").document(driver_id).update({
         "lat": lat, "lon": lon,
