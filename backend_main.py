@@ -28,7 +28,7 @@ from firebase_admin import credentials, firestore
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("harafy")
+log = logging.getLogger("Elite")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,7 +340,7 @@ class GeocodeResult:
 
 class GeocodingEngine:
     _NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
-    _HEADERS = {"User-Agent": "Harafy-App/2.2 (harafy@example.com)"}
+    _HEADERS = {"User-Agent": "Elite-App/2.2 (Elite@example.com)"}
     _TIMEOUT = 6.0
     _EGYPT_VIEWBOX = "24.70,21.97,36.90,31.67"
 
@@ -730,7 +730,7 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>خريطة الرحلة - Harafy</title>
+<title>خريطة الرحلة - Elite</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -794,7 +794,7 @@ def generate_trip_map(origin_lat, origin_lon, dest_lat, dest_lon, route_coords=N
 # ──────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Harafy Utility-Based Agent",
+    title="Elite Utility-Based Agent",
     version="2.0.0",
     description="AI Agent يختار أفضل سائق بناءً على utility function ديناميكية",
 )
@@ -813,7 +813,7 @@ app.add_middleware(
 def health():
     return {
         "status": "ok",
-        "service": "Harafy Utility-Based Agent",
+        "service": "Elite Utility-Based Agent",
         "version": "2.0.0",
         "time_cairo": ContextAnalyser.now_cairo().isoformat(),
         "is_rush_hour": ContextAnalyser.is_rush_hour(),
